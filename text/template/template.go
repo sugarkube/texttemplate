@@ -37,7 +37,9 @@ type Template struct {
 // New allocates a new, undefined template with the given name.
 func New(name string) *Template {
 	t := &Template{
-		name: name,
+		name:       name,
+		leftDelim:  "{{",
+		rightDelim: "}}",
 	}
 	t.init()
 	return t

@@ -15,6 +15,7 @@ const (
 	mapInvalid   missingKeyAction = iota // Return an invalid reflect.Value.
 	mapZeroValue                         // Return the zero value for the map element.
 	mapError                             // Error out
+	mapIgnore                            // Return the unreplaced value
 )
 
 type option struct {
@@ -38,6 +39,8 @@ type option struct {
 //		The operation returns the zero value for the map type's element.
 //	"missingkey=error"
 //		Execution stops immediately with an error.
+//	"missingkey=ignore"
+//		Execution continues and the original value is passed along, excluding any trimmed whitespace.
 //
 func (t *Template) Option(opt ...string) *Template {
 	t.init()
@@ -66,6 +69,9 @@ func (t *Template) setOption(opt string) {
 				return
 			case "error":
 				t.option.missingKey = mapError
+				return
+			case "ignore":
+				t.option.missingKey = mapIgnore
 				return
 			}
 		}

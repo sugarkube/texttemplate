@@ -624,6 +624,11 @@ func (s *state) evalField(dot reflect.Value, fieldName string, node parse.Node, 
 					result = reflect.Zero(receiver.Type().Elem())
 				case mapError:
 					s.errorf("map has no entry for key %q", fieldName)
+				case mapIgnore:
+					// Use a close approximation of the original.  NOTE: If the lexer
+					// found a trim marker, that information is not retained and therefore
+					// not reproducible.
+					result = reflect.ValueOf(strings.Join([]string{s.tmpl.leftDelim, node.String(), s.tmpl.rightDelim}, " "))
 				}
 			}
 			return result

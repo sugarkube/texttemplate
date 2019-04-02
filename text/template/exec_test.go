@@ -1215,6 +1215,18 @@ func TestMissingMapKey(t *testing.T) {
 	if err == nil {
 		t.Errorf("expected error for nil-interface; got none")
 	}
+	// And finally, we ignore the missing value.
+	tmpl.Option("missingkey=ignore")
+	b.Reset()
+	err = tmpl.Execute(&b, data)
+	if err != nil {
+		t.Fatal("default:", err)
+	}
+	want = "99 {{ .y }}"
+	got = b.String()
+	if got != want {
+		t.Errorf("got %q; expected %q", got, want)
+	}
 }
 
 // Test that the error message for multiline unterminated string
