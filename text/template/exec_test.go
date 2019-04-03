@@ -1229,6 +1229,52 @@ func TestMissingMapKey(t *testing.T) {
 	}
 }
 
+// More exhaustive tests for testing ignoring missing map keys
+func TestIgnoreMapKey(t *testing.T) {
+	type item struct {
+		Id   int
+		Name string
+	}
+	data := map[string]interface{}{
+		"x": 99,
+		"items": []item{
+			{Id: 3},
+			{Id: 4, Name: "testname"},
+		},
+	}
+	tmpl, err := New("t1").Option("missingkey=ignore").Parse(
+		`x={{.x | printf "num %d"}} {{.y | printf "y=%s"}}
+{{- if .z }}
+z={{ .z }}
+{{- end }}
+nested={{ .a.b.c }}
+{{- range $item := .items }}
+  id={{ $item.Id }}, name={{ $item.Name }}
+{{- end }}
+end
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b bytes.Buffer
+
+	err = tmpl.Execute(&b, data)
+	if err != nil {
+		t.Fatal("default:", err)
+	}
+
+	want := `x=num 99 {{ .y | printf "y=%s" }}
+nested={{ .a.b.c }}
+  id=3, name=
+  id=4, name=testname
+end
+`
+	got := b.String()
+	if got != want {
+		t.Errorf("got %q; expected %q", got, want)
+	}
+}
+
 // Test that the error message for multiline unterminated string
 // refers to the line number of the opening quote.
 func TestUnterminatedStringError(t *testing.T) {

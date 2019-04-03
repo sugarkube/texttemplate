@@ -251,7 +251,7 @@ func (s *state) walk(dot reflect.Value, node parse.Node) {
 	case *parse.ActionNode:
 		// Do not pop variables so they persist until next end.
 		// Also, if the action declares variables, don't print the result.
-		val := s.evalPipeline(dot, node.Pipe)
+		val := s.evalPipeline(dot, node.Pipe, true)
 		if len(node.Pipe.Decl) == 0 {
 			s.printValue(node, val)
 		}
@@ -280,7 +280,7 @@ func (s *state) walk(dot reflect.Value, node parse.Node) {
 // are identical in behavior except that 'with' sets dot.
 func (s *state) walkIfOrWith(typ parse.NodeType, dot reflect.Value, pipe *parse.PipeNode, list, elseList *parse.ListNode) {
 	defer s.pop(s.mark())
-	val := s.evalPipeline(dot, pipe)
+	val := s.evalPipeline(dot, pipe, false)
 	truth, ok := isTrue(val)
 	if !ok {
 		s.errorf("if/with can't use %v", val)
@@ -334,7 +334,7 @@ func isTrue(val reflect.Value) (truth, ok bool) {
 func (s *state) walkRange(dot reflect.Value, r *parse.RangeNode) {
 	s.at(r)
 	defer s.pop(s.mark())
-	val, _ := indirect(s.evalPipeline(dot, r.Pipe))
+	val, _ := indirect(s.evalPipeline(dot, r.Pipe, false))
 	// mark top of stack before any variables in the body are pushed.
 	mark := s.mark()
 	oneIteration := func(index, elem reflect.Value) {
@@ -403,7 +403,7 @@ func (s *state) walkTemplate(dot reflect.Value, t *parse.TemplateNode) {
 		s.errorf("exceeded maximum template depth (%v)", maxExecDepth)
 	}
 	// Variables declared by the pipeline persist.
-	dot = s.evalPipeline(dot, t.Pipe)
+	dot = s.evalPipeline(dot, t.Pipe, false)
 	newState := *s
 	newState.depth++
 	newState.tmpl = tmpl
@@ -420,14 +420,33 @@ func (s *state) walkTemplate(dot reflect.Value, t *parse.TemplateNode) {
 // pipeline has a variable declaration, the variable will be pushed on the
 // stack. Callers should therefore pop the stack after they are finished
 // executing commands depending on the pipeline value.
-func (s *state) evalPipeline(dot reflect.Value, pipe *parse.PipeNode) (value reflect.Value) {
+
+// If the user has used the mapIgnore option and missing map keys are found, the
+// original template tag will be reconstructed and returned (but note whitespace
+// may not be preserved due to limitations in the lexer), providing callers permit
+// that behaviour by setting `ignorable=true`.
+func (s *state) evalPipeline(dot reflect.Value, pipe *parse.PipeNode, ignorable bool) (value reflect.Value) {
 	if pipe == nil {
 		return
 	}
+	var ignore bool
 	s.at(pipe)
 	value = missingVal
 	for _, cmd := range pipe.Cmds {
-		value = s.evalCommand(dot, cmd, value) // previous value is this one's final arg.
+		value, ignore = s.evalCommand(dot, cmd, value)
+
+		// if we're supposed to skip evaluating this tag, replace it with the original pipeline (note: whitespace around
+		// delimiters won't be preserved because the lexer doesn't preserve it)
+		if ignore {
+			// not all callers of this method permit ignoring nodes (e.g. when parsing `if` commands), so
+			// only return the original tag if the caller permits it
+			if ignorable {
+				return reflect.ValueOf(strings.Join([]string{s.tmpl.leftDelim, pipe.String(), s.tmpl.rightDelim}, " "))
+			} else {
+				return value
+			}
+		}
+		// previous value is this one's final arg.
 		// If the object has type interface{}, dig down one level to the thing inside.
 		if value.Kind() == reflect.Interface && value.Type().NumMethod() == 0 {
 			value = reflect.ValueOf(value.Interface()) // lovely!
@@ -449,7 +468,7 @@ func (s *state) notAFunction(args []parse.Node, final reflect.Value) {
 	}
 }
 
-func (s *state) evalCommand(dot reflect.Value, cmd *parse.CommandNode, final reflect.Value) reflect.Value {
+func (s *state) evalCommand(dot reflect.Value, cmd *parse.CommandNode, final reflect.Value) (reflect.Value, bool) {
 	firstWord := cmd.Args[0]
 	switch n := firstWord.(type) {
 	case *parse.FieldNode:
@@ -461,7 +480,7 @@ func (s *state) evalCommand(dot reflect.Value, cmd *parse.CommandNode, final ref
 		return s.evalFunction(dot, n, cmd, cmd.Args, final)
 	case *parse.PipeNode:
 		// Parenthesized pipeline. The arguments are all inside the pipeline; final is ignored.
-		return s.evalPipeline(dot, n)
+		return s.evalPipeline(dot, n, true), false
 	case *parse.VariableNode:
 		return s.evalVariableNode(dot, n, cmd.Args, final)
 	}
@@ -469,15 +488,15 @@ func (s *state) evalCommand(dot reflect.Value, cmd *parse.CommandNode, final ref
 	s.notAFunction(cmd.Args, final)
 	switch word := firstWord.(type) {
 	case *parse.BoolNode:
-		return reflect.ValueOf(word.True)
+		return reflect.ValueOf(word.True), false
 	case *parse.DotNode:
-		return dot
+		return dot, false
 	case *parse.NilNode:
 		s.errorf("nil is not a command")
 	case *parse.NumberNode:
-		return s.idealConstant(word)
+		return s.idealConstant(word), false
 	case *parse.StringNode:
-		return reflect.ValueOf(word.Text)
+		return reflect.ValueOf(word.Text), false
 	}
 	s.errorf("can't evaluate command %q", firstWord)
 	panic("not reached")
@@ -513,12 +532,12 @@ func isHexInt(s string) bool {
 	return len(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') && !strings.ContainsAny(s, "pP")
 }
 
-func (s *state) evalFieldNode(dot reflect.Value, field *parse.FieldNode, args []parse.Node, final reflect.Value) reflect.Value {
+func (s *state) evalFieldNode(dot reflect.Value, field *parse.FieldNode, args []parse.Node, final reflect.Value) (reflect.Value, bool) {
 	s.at(field)
 	return s.evalFieldChain(dot, dot, field, field.Ident, args, final)
 }
 
-func (s *state) evalChainNode(dot reflect.Value, chain *parse.ChainNode, args []parse.Node, final reflect.Value) reflect.Value {
+func (s *state) evalChainNode(dot reflect.Value, chain *parse.ChainNode, args []parse.Node, final reflect.Value) (reflect.Value, bool) {
 	s.at(chain)
 	if len(chain.Field) == 0 {
 		s.errorf("internal error: no fields in evalChainNode")
@@ -527,17 +546,20 @@ func (s *state) evalChainNode(dot reflect.Value, chain *parse.ChainNode, args []
 		s.errorf("indirection through explicit nil in %s", chain)
 	}
 	// (pipe).Field1.Field2 has pipe as .Node, fields as .Field. Eval the pipeline, then the fields.
-	pipe := s.evalArg(dot, nil, chain.Node)
+	pipe, ignore := s.evalArg(dot, nil, chain.Node)
+	if ignore {
+		return pipe, ignore
+	}
 	return s.evalFieldChain(dot, pipe, chain, chain.Field, args, final)
 }
 
-func (s *state) evalVariableNode(dot reflect.Value, variable *parse.VariableNode, args []parse.Node, final reflect.Value) reflect.Value {
+func (s *state) evalVariableNode(dot reflect.Value, variable *parse.VariableNode, args []parse.Node, final reflect.Value) (reflect.Value, bool) {
 	// $x.Field has $x as the first ident, Field as the second. Eval the var, then the fields.
 	s.at(variable)
 	value := s.varValue(variable.Ident[0])
 	if len(variable.Ident) == 1 {
 		s.notAFunction(args, final)
-		return value
+		return value, false
 	}
 	return s.evalFieldChain(dot, value, variable, variable.Ident[1:], args, final)
 }
@@ -545,16 +567,21 @@ func (s *state) evalVariableNode(dot reflect.Value, variable *parse.VariableNode
 // evalFieldChain evaluates .X.Y.Z possibly followed by arguments.
 // dot is the environment in which to evaluate arguments, while
 // receiver is the value being walked along the chain.
-func (s *state) evalFieldChain(dot, receiver reflect.Value, node parse.Node, ident []string, args []parse.Node, final reflect.Value) reflect.Value {
+func (s *state) evalFieldChain(dot, receiver reflect.Value, node parse.Node, ident []string, args []parse.Node, final reflect.Value) (reflect.Value, bool) {
+	var ignore bool
 	n := len(ident)
 	for i := 0; i < n-1; i++ {
-		receiver = s.evalField(dot, ident[i], node, nil, missingVal, receiver)
+		receiver, ignore = s.evalField(dot, ident[i], node, nil, missingVal, receiver)
+		// if we're meant to ignore the tag, return immediately
+		if ignore {
+			return receiver, ignore
+		}
 	}
 	// Now if it's a method, it gets the arguments.
 	return s.evalField(dot, ident[n-1], node, args, final, receiver)
 }
 
-func (s *state) evalFunction(dot reflect.Value, node *parse.IdentifierNode, cmd parse.Node, args []parse.Node, final reflect.Value) reflect.Value {
+func (s *state) evalFunction(dot reflect.Value, node *parse.IdentifierNode, cmd parse.Node, args []parse.Node, final reflect.Value) (reflect.Value, bool) {
 	s.at(node)
 	name := node.Ident
 	function, ok := findFunction(name, s.tmpl)
@@ -567,12 +594,16 @@ func (s *state) evalFunction(dot reflect.Value, node *parse.IdentifierNode, cmd 
 // evalField evaluates an expression like (.Field) or (.Field arg1 arg2).
 // The 'final' argument represents the return value from the preceding
 // value of the pipeline, if any.
-func (s *state) evalField(dot reflect.Value, fieldName string, node parse.Node, args []parse.Node, final, receiver reflect.Value) reflect.Value {
+// This method returns the result of evaluating the field, and also a
+// boolean indicating whether no map key was found and users have opted to
+// keep the original template tag in that case. Callers can use this boolean
+// return value to short-circuit further evaluation of the pipeline.
+func (s *state) evalField(dot reflect.Value, fieldName string, node parse.Node, args []parse.Node, final, receiver reflect.Value) (reflect.Value, bool) {
 	if !receiver.IsValid() {
 		if s.tmpl.option.missingKey == mapError { // Treat invalid value as missing map key.
 			s.errorf("nil data; no entry for key %q", fieldName)
 		}
-		return zero
+		return zero, false
 	}
 	typ := receiver.Type()
 	receiver, isNil := indirect(receiver)
@@ -580,7 +611,7 @@ func (s *state) evalField(dot reflect.Value, fieldName string, node parse.Node, 
 		// Calling a method on a nil interface can't work. The
 		// MethodByName method call below would panic.
 		s.errorf("nil pointer evaluating %s.%s", typ, fieldName)
-		return zero
+		return zero, false
 	}
 
 	// Unless it's an interface, need to get to a value of type *T to guarantee
@@ -606,7 +637,7 @@ func (s *state) evalField(dot reflect.Value, fieldName string, node parse.Node, 
 			if hasArgs {
 				s.errorf("%s has arguments but cannot be invoked as function", fieldName)
 			}
-			return field
+			return field, false
 		}
 	case reflect.Map:
 		// If it's a map, attempt to use the field name as a key.
@@ -625,13 +656,11 @@ func (s *state) evalField(dot reflect.Value, fieldName string, node parse.Node, 
 				case mapError:
 					s.errorf("map has no entry for key %q", fieldName)
 				case mapIgnore:
-					// Use a close approximation of the original.  NOTE: If the lexer
-					// found a trim marker, that information is not retained and therefore
-					// not reproducible.
-					result = reflect.ValueOf(strings.Join([]string{s.tmpl.leftDelim, node.String(), s.tmpl.rightDelim}, " "))
+					// the whole pipeline should be ignored
+					return reflect.Zero(receiver.Type().Elem()), true
 				}
 			}
-			return result
+			return result, false
 		}
 	case reflect.Ptr:
 		etyp := receiver.Type().Elem()
@@ -659,7 +688,7 @@ var (
 // evalCall executes a function or method call. If it's a method, fun already has the receiver bound, so
 // it looks just like a function call. The arg list, if non-nil, includes (in the manner of the shell), arg[0]
 // as the function itself.
-func (s *state) evalCall(dot, fun reflect.Value, node parse.Node, name string, args []parse.Node, final reflect.Value) reflect.Value {
+func (s *state) evalCall(dot, fun reflect.Value, node parse.Node, name string, args []parse.Node, final reflect.Value) (reflect.Value, bool) {
 	if args != nil {
 		args = args[1:] // Zeroth arg is function name/node; not passed to function.
 	}
@@ -684,15 +713,22 @@ func (s *state) evalCall(dot, fun reflect.Value, node parse.Node, name string, a
 	// Build the arg list.
 	argv := make([]reflect.Value, numIn)
 	// Args must be evaluated. Fixed args first.
+	var ignore bool
 	i := 0
 	for ; i < numFixed && i < len(args); i++ {
-		argv[i] = s.evalArg(dot, typ.In(i), args[i])
+		argv[i], ignore = s.evalArg(dot, typ.In(i), args[i])
+		if ignore {
+			return reflect.Zero(typ.Elem()), ignore
+		}
 	}
 	// Now the ... args.
 	if typ.IsVariadic() {
 		argType := typ.In(typ.NumIn() - 1).Elem() // Argument is a slice.
 		for ; i < len(args); i++ {
-			argv[i] = s.evalArg(dot, argType, args[i])
+			argv[i], ignore = s.evalArg(dot, argType, args[i])
+			if ignore {
+				return reflect.Zero(typ.Elem()), ignore
+			}
 		}
 	}
 	// Add final value if necessary.
@@ -721,7 +757,7 @@ func (s *state) evalCall(dot, fun reflect.Value, node parse.Node, name string, a
 	if v.Type() == reflectValueType {
 		v = v.Interface().(reflect.Value)
 	}
-	return v
+	return v, false
 }
 
 // canBeNil reports whether an untyped nil can be assigned to the type. See reflect.Zero.
@@ -778,48 +814,54 @@ func (s *state) validateType(value reflect.Value, typ reflect.Type) reflect.Valu
 	return value
 }
 
-func (s *state) evalArg(dot reflect.Value, typ reflect.Type, n parse.Node) reflect.Value {
+func (s *state) evalArg(dot reflect.Value, typ reflect.Type, n parse.Node) (reflect.Value, bool) {
+	fmt.Printf("\neval arg: %s\n", n.String())
 	s.at(n)
 	switch arg := n.(type) {
 	case *parse.DotNode:
-		return s.validateType(dot, typ)
+		return s.validateType(dot, typ), false
 	case *parse.NilNode:
 		if canBeNil(typ) {
-			return reflect.Zero(typ)
+			return reflect.Zero(typ), false
 		}
 		s.errorf("cannot assign nil to %s", typ)
 	case *parse.FieldNode:
-		return s.validateType(s.evalFieldNode(dot, arg, []parse.Node{n}, missingVal), typ)
+		res, ignore := s.evalFieldNode(dot, arg, []parse.Node{n}, missingVal)
+		return s.validateType(res, typ), ignore
 	case *parse.VariableNode:
-		return s.validateType(s.evalVariableNode(dot, arg, nil, missingVal), typ)
+		res, ignore := s.evalVariableNode(dot, arg, nil, missingVal)
+		return s.validateType(res, typ), ignore
 	case *parse.PipeNode:
-		return s.validateType(s.evalPipeline(dot, arg), typ)
+		return s.validateType(s.evalPipeline(dot, arg, true), typ), false
 	case *parse.IdentifierNode:
-		return s.validateType(s.evalFunction(dot, arg, arg, nil, missingVal), typ)
+		res, ignore := s.evalFunction(dot, arg, arg, nil, missingVal)
+		return s.validateType(res, typ), ignore
 	case *parse.ChainNode:
-		return s.validateType(s.evalChainNode(dot, arg, nil, missingVal), typ)
+		res, ignore := s.evalChainNode(dot, arg, nil, missingVal)
+		return s.validateType(res, typ), ignore
 	}
 	switch typ.Kind() {
 	case reflect.Bool:
-		return s.evalBool(typ, n)
+		return s.evalBool(typ, n), false
 	case reflect.Complex64, reflect.Complex128:
-		return s.evalComplex(typ, n)
+		return s.evalComplex(typ, n), false
 	case reflect.Float32, reflect.Float64:
-		return s.evalFloat(typ, n)
+		return s.evalFloat(typ, n), false
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return s.evalInteger(typ, n)
+		return s.evalInteger(typ, n), false
 	case reflect.Interface:
 		if typ.NumMethod() == 0 {
 			return s.evalEmptyInterface(dot, n)
 		}
 	case reflect.Struct:
 		if typ == reflectValueType {
-			return reflect.ValueOf(s.evalEmptyInterface(dot, n))
+			res, ignore := s.evalEmptyInterface(dot, n)
+			return reflect.ValueOf(res), ignore
 		}
 	case reflect.String:
-		return s.evalString(typ, n)
+		return s.evalString(typ, n), false
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return s.evalUnsignedInteger(typ, n)
+		return s.evalUnsignedInteger(typ, n), false
 	}
 	s.errorf("can't handle %s for arg of type %s", n, typ)
 	panic("not reached")
@@ -890,13 +932,13 @@ func (s *state) evalComplex(typ reflect.Type, n parse.Node) reflect.Value {
 	panic("not reached")
 }
 
-func (s *state) evalEmptyInterface(dot reflect.Value, n parse.Node) reflect.Value {
+func (s *state) evalEmptyInterface(dot reflect.Value, n parse.Node) (reflect.Value, bool) {
 	s.at(n)
 	switch n := n.(type) {
 	case *parse.BoolNode:
-		return reflect.ValueOf(n.True)
+		return reflect.ValueOf(n.True), false
 	case *parse.DotNode:
-		return dot
+		return dot, false
 	case *parse.FieldNode:
 		return s.evalFieldNode(dot, n, nil, missingVal)
 	case *parse.IdentifierNode:
@@ -905,13 +947,13 @@ func (s *state) evalEmptyInterface(dot reflect.Value, n parse.Node) reflect.Valu
 		// NilNode is handled in evalArg, the only place that calls here.
 		s.errorf("evalEmptyInterface: nil (can't happen)")
 	case *parse.NumberNode:
-		return s.idealConstant(n)
+		return s.idealConstant(n), false
 	case *parse.StringNode:
-		return reflect.ValueOf(n.Text)
+		return reflect.ValueOf(n.Text), false
 	case *parse.VariableNode:
 		return s.evalVariableNode(dot, n, nil, missingVal)
 	case *parse.PipeNode:
-		return s.evalPipeline(dot, n)
+		return s.evalPipeline(dot, n, true), false
 	}
 	s.errorf("can't handle assignment of %s to empty interface argument", n)
 	panic("not reached")
