@@ -1231,13 +1231,12 @@ func TestMissingMapKey(t *testing.T) {
 
 // More exhaustive tests for testing ignoring missing map keys
 func TestIgnoreMapKey(t *testing.T) {
-	type item struct {
-		Id   int
-		Name string
-	}
 	data := map[string]interface{}{
 		"x": 99,
-		"items": []item{
+		"items": []struct {
+			Id   int
+			Name string
+		}{
 			{Id: 3},
 			{Id: 4, Name: "testname"},
 		},
