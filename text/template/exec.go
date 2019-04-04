@@ -815,7 +815,6 @@ func (s *state) validateType(value reflect.Value, typ reflect.Type) reflect.Valu
 }
 
 func (s *state) evalArg(dot reflect.Value, typ reflect.Type, n parse.Node) (reflect.Value, bool) {
-	fmt.Printf("\neval arg: %s\n", n.String())
 	s.at(n)
 	switch arg := n.(type) {
 	case *parse.DotNode:
